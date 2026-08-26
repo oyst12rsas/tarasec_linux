@@ -26,22 +26,41 @@ footer() {
     exit 0
 }
 
+access_allowed() {
+    /usr/local/sbin/tarasec-access-check "$clientip"
+}
+
 click_to_continue() {
-    if [ "$continue" = "clicked" ]; then thankyou_page; footer; fi
+    if [ "$continue" = "clicked" ]; then access_decision_page; footer; fi
     continue_form; footer
 }
 
 continue_form() {
-    echo "<h2>Welcome to TaraSec WiFi</h2><p class=\"lead\">You are connected to <b>$client_zone</b>. Continue to enable Internet access.</p>
+    echo "<h2>Welcome to TaraSec WiFi</h2><p class=\"lead\">You are connected to <b>$client_zone</b>. Continue to check Internet access for this device.</p>
 <div class=\"note\"><b>What TaraSec is doing</b><br>The hotspot provides Internet connectivity and can use network-level security information to help identify potentially infected or abusive traffic. A warning does not by itself mean a person has committed an offence; devices can become infected accidentally.</div>
 <div class=\"research\"><b>Privacy and research</b><br>Normal hotspot operation requires technical connection information such as addresses and session data. Optional TaraSec research or precise location sharing must be presented separately and is not enabled merely by pressing Continue here.</div>
-<form action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\"><input type=\"hidden\" name=\"continue\" value=\"clicked\">$custom_inputs<input class=\"btn\" type=\"submit\" value=\"Continue to Internet\"></form>"
+<form action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\"><input type=\"hidden\" name=\"continue\" value=\"clicked\">$custom_inputs<input class=\"btn\" type=\"submit\" value=\"Check access\"></form>"
     read_terms; footer
+}
+
+access_decision_page() {
+    if access_allowed; then
+        thankyou_page
+    else
+        denied_page
+    fi
+}
+
+denied_page() {
+    echo "<div class=\"bad\">Internet access is not active</div><p>This device does not currently have access on this hotspot.</p>
+<div class=\"note\"><b>Access required</b><br>If this hotspot charges for access, use the hotspot's payment or access instructions. If payment has already been made, try the access check again after it has been registered.</div>
+<form action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\"><input type=\"hidden\" name=\"continue\" value=\"clicked\">$custom_inputs<input class=\"btn\" type=\"submit\" value=\"Check access again\"></form>"
+    read_terms
 }
 
 thankyou_page() {
     if [ -z "$custom" ]; then customhtml=""; else customhtml="<input type=\"hidden\" name=\"custom\" value=\"$custom\">"; fi
-    echo "<h2>Ready to connect</h2><p>Thanks for using this TaraSec hotspot. Press the button below to authorize this device and open Internet access.</p>
+    echo "<h2>Access confirmed</h2><p>This device has active TaraSec hotspot access. Press the button below to authorize it in openNDS and open Internet access.</p>
 <div class=\"note\"><b>Security notice</b><br>TaraSec may warn users or hotspot operators when network behaviour suggests an infected device. The aim is to help clean devices and reduce harmful traffic, not to label ordinary users as criminals.</div>
 <form action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\">$customhtml$custom_passthrough<input type=\"hidden\" name=\"landing\" value=\"yes\"><input class=\"btn\" type=\"submit\" value=\"Enable Internet access\"></form>"
     read_terms; footer
