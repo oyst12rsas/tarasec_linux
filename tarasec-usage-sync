@@ -1,16 +1,19 @@
 #!/bin/bash
-# Synchronize openNDS cumulative per-session byte counters into TaraSec's
-# existing userusage/radcheck accounting model.
+# Synchronize actual per-client forwarded IPv4 bytes into TaraSec's existing
+# userusage/radcheck accounting model.
 #
-# The state file remembers the last cumulative counter seen for each
-# MAC+openNDS session_start, so each poll writes only the byte delta and does
-# not double count across timer runs or service restarts.
+# openNDS is used only to identify authenticated client IP/session pairs.
+# Byte accounting comes from TaraSec-owned forwarding counter rules so inbound
+# downloads (including YouTube/QUIC UDP/443) and outbound uploads are both
+# counted accurately.
 set -u
 
 DB_NAME="${TARASEC_ACCESS_DB:-taransvar}"
 MYSQL_CNF="${TARASEC_ACCESS_MYSQL_CNF:-/etc/tarasec/access-mysql.cnf}"
-STATE="${TARASEC_USAGE_COUNTER_STATE:-/var/lib/tarasec/opennds-usage-state.json}"
+STATE="${TARASEC_USAGE_COUNTER_STATE:-/var/lib/tarasec/hotspot-forward-usage-state.json}"
 OUT="${TARASEC_USAGE_STATE:-/run/tarasec-usage-sync.json}"
+COUNT_CHAIN="TARASEC-HOTSPOT-COUNT"
+FWD_CHAIN="TARASEC-HOTSPOT-FWD"
 
 MYSQL=(mysql)
 if [ -r "$MYSQL_CNF" ]; then MYSQL+=(--defaults-extra-file="$MYSQL_CNF"); fi
@@ -18,56 +21,122 @@ MYSQL+=(--batch --skip-column-names --raw "$DB_NAME")
 
 mkdir -p "$(dirname "$STATE")"
 TMP_JSON=$(mktemp)
+TMP_CLIENTS=$(mktemp)
+TMP_CURRENT=$(mktemp)
 TMP_ROWS=$(mktemp)
 TMP_STATE=$(mktemp)
-trap 'rm -f "$TMP_JSON" "$TMP_ROWS" "$TMP_STATE"' EXIT
+trap 'rm -f "$TMP_JSON" "$TMP_CLIENTS" "$TMP_CURRENT" "$TMP_ROWS" "$TMP_STATE"' EXIT
 
-if ! command -v ndsctl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
-  printf '{"ok":false,"clients":0,"accounted":0,"bytes":0,"errors":1,"reason":"missing_ndsctl_or_python"}\n' >"$OUT"
+fail() {
+  local reason="$1"
+  printf '{"ok":false,"clients":0,"accounted":0,"bytes":0,"errors":1,"reason":"%s"}\n' "$reason" >"$OUT"
   exit 1
-fi
+}
 
-if ! ndsctl json >"$TMP_JSON" 2>/dev/null; then
-  printf '{"ok":false,"clients":0,"accounted":0,"bytes":0,"errors":1,"reason":"ndsctl_failed"}\n' >"$OUT"
-  exit 1
-fi
+command -v ndsctl >/dev/null 2>&1 || fail missing_ndsctl
+command -v python3 >/dev/null 2>&1 || fail missing_python
+command -v iptables >/dev/null 2>&1 || fail missing_iptables
+command -v iptables-save >/dev/null 2>&1 || fail missing_iptables_save
 
-# Output one row per authenticated client:
-# state-key<TAB>ip<TAB>current-total-bytes<TAB>delta-bytes
-# The first sighting of a session is counted from zero. Persistent state then
-# prevents recounting that traffic on subsequent runs/restarts.
-python3 - "$TMP_JSON" "$STATE" "$TMP_STATE" >"$TMP_ROWS" <<'PY'
-import json, sys
-src, state_path, out_state = sys.argv[1:]
-with open(src, encoding='utf-8') as f:
-    data = json.load(f)
-try:
-    with open(state_path, encoding='utf-8') as f:
-        old = json.load(f)
-except Exception:
-    old = {}
-new = {}
-for mac, c in data.get('clients', {}).items():
+ndsctl json >"$TMP_JSON" 2>/dev/null || fail ndsctl_failed
+
+# Authenticated IPv4 clients only: IP<TAB>openNDS-session-start
+python3 - "$TMP_JSON" >"$TMP_CLIENTS" <<'PY'
+import json, ipaddress, sys
+with open(sys.argv[1], encoding='utf-8') as f:
+    data=json.load(f)
+for _mac,c in data.get('clients',{}).items():
     if c.get('state') != 'Authenticated':
         continue
-    ip = str(c.get('ip', ''))
-    session_start = str(c.get('session_start', ''))
+    ip=str(c.get('ip',''))
     try:
-        down = int(c.get('download_this_session') or 0)
-        up = int(c.get('upload_this_session') or 0)
-    except (TypeError, ValueError):
+        if ipaddress.ip_address(ip).version != 4:
+            continue
+    except ValueError:
         continue
-    total = max(0, down) + max(0, up)
-    key = f"{mac}|{session_start}"
-    try:
-        previous = int(old.get(key, 0))
-    except (TypeError, ValueError):
-        previous = 0
-    delta = total - previous if total >= previous else total
-    new[key] = total
-    print(f"{key}\t{ip}\t{total}\t{max(0, delta)}")
-with open(out_state, 'w', encoding='utf-8') as f:
-    json.dump(new, f, separators=(',', ':'))
+    print(f"{ip}\t{c.get('session_start','')}")
+PY
+
+# Detect TaraSec client and upstream interfaces exactly as the firewall does.
+CLIENT_IF="${TARASEC_BRIDGE:-}"
+[ -r /etc/tarasec/hotspot.env ] && . /etc/tarasec/hotspot.env
+CLIENT_IF="${TARASEC_BRIDGE:-$CLIENT_IF}"
+if [ -z "$CLIENT_IF" ] || ! ip link show "$CLIENT_IF" >/dev/null 2>&1; then
+  CLIENT_IF=$(awk '$1=="GatewayInterface"{v=$2} END{print v}' /etc/opennds/opennds.conf 2>/dev/null || true)
+fi
+[ -n "$CLIENT_IF" ] && ip link show "$CLIENT_IF" >/dev/null 2>&1 || fail client_interface_not_found
+
+UPSTREAMS="${TARASEC_UPSTREAM_IFACES:-}"
+if [ -z "$UPSTREAMS" ]; then
+  UPSTREAMS=$(ip -o route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u | tr '\n' ' ')
+fi
+[ -n "$UPSTREAMS" ] || fail upstream_not_found
+
+# Ensure the dedicated counter chain exists and is reached before the generic
+# TaraSec hotspot ACCEPT rules. Counter rules RETURN to the forwarding chain;
+# they never authorize traffic themselves.
+iptables -N "$COUNT_CHAIN" 2>/dev/null || true
+iptables -N "$FWD_CHAIN" 2>/dev/null || true
+iptables -C "$FWD_CHAIN" -j "$COUNT_CHAIN" 2>/dev/null || iptables -I "$FWD_CHAIN" 1 -j "$COUNT_CHAIN"
+iptables -C "$COUNT_CHAIN" -j RETURN 2>/dev/null || iptables -A "$COUNT_CHAIN" -j RETURN
+
+# Add missing directional counter rules for each authenticated client/session.
+# Session start is part of the comment so an IP reused by another login gets a
+# fresh counter identity rather than inheriting the previous user's state.
+while IFS=$'\t' read -r ip session_start; do
+  [ -n "$ip" ] || continue
+  session_start=${session_start:-0}
+  for upstream in $UPSTREAMS; do
+    [ "$upstream" = "$CLIENT_IF" ] && continue
+    up_tag="TSUP:${session_start}:${ip}:${upstream}"
+    dn_tag="TSDN:${session_start}:${ip}:${upstream}"
+    iptables -C "$COUNT_CHAIN" -i "$CLIENT_IF" -o "$upstream" -s "$ip" -m comment --comment "$up_tag" -j RETURN 2>/dev/null || \
+      iptables -I "$COUNT_CHAIN" 1 -i "$CLIENT_IF" -o "$upstream" -s "$ip" -m comment --comment "$up_tag" -j RETURN
+    iptables -C "$COUNT_CHAIN" -i "$upstream" -o "$CLIENT_IF" -d "$ip" -m comment --comment "$dn_tag" -j RETURN 2>/dev/null || \
+      iptables -I "$COUNT_CHAIN" 1 -i "$upstream" -o "$CLIENT_IF" -d "$ip" -m comment --comment "$dn_tag" -j RETURN
+  done
+done <"$TMP_CLIENTS"
+
+# Snapshot exact byte counters. For each active IP/session, sum all upstream
+# upload + download rules. iptables-save -c exposes counters as [packets:bytes].
+SAVE=$(iptables-save -c)
+while IFS=$'\t' read -r ip session_start; do
+  [ -n "$ip" ] || continue
+  session_start=${session_start:-0}
+  key="${ip}|${session_start}"
+  total=$(printf '%s\n' "$SAVE" | awk -v sess="$session_start" -v ip="$ip" '
+    $0 ~ "^-?\\[[0-9]+:[0-9]+\\] -A TARASEC-HOTSPOT-COUNT " &&
+    (index($0,"--comment \"TSUP:" sess ":" ip ":") || index($0,"--comment \"TSDN:" sess ":" ip ":")) {
+      x=$1; gsub(/^\[/,"",x); gsub(/\]$/,"",x); split(x,a,":"); sum+=a[2]
+    }
+    END{printf "%.0f",sum+0}
+  ')
+  printf '%s\t%s\t%s\n' "$key" "$ip" "${total:-0}" >>"$TMP_CURRENT"
+done <"$TMP_CLIENTS"
+
+# Compare absolute firewall counters with the last successful poll. A counter
+# reset (firewall reload/reboot) uses the new absolute value as the delta.
+python3 - "$TMP_CURRENT" "$STATE" "$TMP_STATE" >"$TMP_ROWS" <<'PY'
+import json, sys
+current_path,state_path,out_state=sys.argv[1:]
+try:
+    with open(state_path,encoding='utf-8') as f: old=json.load(f)
+except Exception:
+    old={}
+new={}
+with open(current_path,encoding='utf-8') as f:
+    for line in f:
+        line=line.rstrip('\n')
+        if not line: continue
+        key,ip,total_s=line.split('\t')
+        total=max(0,int(total_s or 0))
+        try: prev=max(0,int(old.get(key,0)))
+        except Exception: prev=0
+        delta=total-prev if total>=prev else total
+        new[key]=total
+        print(f"{key}\t{ip}\t{total}\t{max(0,delta)}")
+with open(out_state,'w',encoding='utf-8') as f:
+    json.dump(new,f,separators=(',',':'))
 PY
 
 clients=0
@@ -80,10 +149,6 @@ while IFS=$'\t' read -r key ip total delta; do
   [ -n "$ip" ] || continue
   clients=$((clients+1))
 
-  if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    continue
-  fi
-
   username=$("${MYSQL[@]}" -e "SELECT s.username FROM session s WHERE s.ip='$ip' AND s.active=1 AND s.logouttime IS NULL ORDER BY s.logintime DESC LIMIT 1" 2>/dev/null | head -1) || {
     errors=$((errors+1)); continue;
   }
@@ -92,17 +157,15 @@ while IFS=$'\t' read -r key ip total delta; do
   userhex=$(printf '%s' "$username" | od -An -tx1 | tr -d ' \n')
   [ -n "$userhex" ] || continue
 
-  # Keep the active TaraSec session alive even in a minute with zero bytes.
+  # Keep session alive whenever openNDS still reports the client authenticated.
   if ! "${MYSQL[@]}" -e "UPDATE session SET lastrequest=NOW() WHERE ip='$ip' AND username=CONVERT(0x$userhex USING latin1) AND active=1 AND logouttime IS NULL" >/dev/null 2>&1; then
-    errors=$((errors+1))
-    continue
+    errors=$((errors+1)); continue
   fi
 
   [ "${delta:-0}" -gt 0 ] || continue
-
   mb=$(python3 - "$delta" <<'PY'
 import sys
-print(int(sys.argv[1]) / (1024.0 * 1024.0))
+print(int(sys.argv[1])/(1024.0*1024.0))
 PY
 )
 
@@ -121,18 +184,17 @@ SQL
     bytes=$((bytes+delta))
   else
     errors=$((errors+1))
-    logger -t tarasec-usage "failed accounting for $ip/$username"
+    logger -t tarasec-usage "failed forwarding accounting for $ip/$username"
   fi
 done <"$TMP_ROWS"
 
-# Only advance cumulative counters when the DB pass succeeded completely.
-# That makes a failed run retry the same deltas rather than silently losing
-# usage. With the normal single/few-client hotspot this keeps accounting safe.
+# Advance counter state only after a completely successful DB pass. Failed
+# runs therefore retry rather than silently losing usage.
 if [ "$errors" -eq 0 ]; then
   install -m 0600 "$TMP_STATE" "$STATE"
 fi
 
 ok=true
 [ "$errors" -eq 0 ] || ok=false
-printf '{"ok":%s,"clients":%d,"accounted":%d,"bytes":%d,"errors":%d}\n' "$ok" "$clients" "$accounted" "$bytes" "$errors" >"$OUT"
+printf '{"ok":%s,"clients":%d,"accounted":%d,"bytes":%d,"errors":%d,"source":"forwarding_counters"}\n' "$ok" "$clients" "$accounted" "$bytes" "$errors" >"$OUT"
 [ "$errors" -eq 0 ]
