@@ -15,8 +15,11 @@ install -m 0755 "$DIR/tarasec-hotspot-firewall" /usr/local/sbin/tarasec-hotspot-
 
 # The local captive-portal name must be answered by the dedicated hotspot DNS server.
 if [ -f /etc/tarasec/dnsmasq-hotspot.conf ]; then
-  grep -q '^address=/status\.client/' /etc/tarasec/dnsmasq-hotspot.conf || \
-    echo 'address=/status.client/192.168.50.1' >> /etc/tarasec/dnsmasq-hotspot.conf
+  HOTSPOT_ADDR=$(sed -n 's/^listen-address=//p' /etc/tarasec/dnsmasq-hotspot.conf | head -1)
+  if [ -n "$HOTSPOT_ADDR" ]; then
+    sed -i '/^address=\/status\.client\//d' /etc/tarasec/dnsmasq-hotspot.conf
+    echo "address=/status.client/$HOTSPOT_ADDR" >> /etc/tarasec/dnsmasq-hotspot.conf
+  fi
 fi
 
 systemctl restart tarasec-hotspot-firewall.service
