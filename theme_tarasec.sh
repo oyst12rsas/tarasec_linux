@@ -33,7 +33,9 @@ access_allowed() {
 hotspot_web_base() {
     local host="${gatewayaddress%%:*}"
     [ -n "$host" ] || host="192.168.50.1"
-    printf 'http://%s/hotspot' "$host"
+    # Port 80 is intentionally intercepted by openNDS for captive clients.
+    # Subscriber login therefore uses the dedicated local Apache listener.
+    printf 'http://%s:8080/hotspot' "$host"
 }
 
 click_to_continue() {
