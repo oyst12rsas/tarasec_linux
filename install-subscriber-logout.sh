@@ -46,7 +46,8 @@ if [[ "$MAC" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
 fi
 logger -t tarasec-logout "subscriber logout closed TaraSec session/access for $IP${MAC:+/$MAC}"
 SH
-install -o root -g root -m 0755 "$HELPER" "$HELPER"
+chmod 0755 "$HELPER"
+chown root:root "$HELPER"
 
 cat > "$SUDOERS" <<EOF
 www-data ALL=(root) NOPASSWD: $HELPER *
@@ -54,6 +55,7 @@ EOF
 chmod 0440 "$SUDOERS"
 visudo -cf "$SUDOERS" >/dev/null
 
+install -d -o root -g www-data -m 0755 "$(dirname "$STATUS")"
 cat > "$STATUS" <<'PHP'
 <?php
 declare(strict_types=1);
