@@ -1,0 +1,64 @@
+#!/bin/bash
+# TaraSec hotspot firewall: manage only TaraSec-owned chains.
+# Never flush global INPUT/FORWARD/NAT state or change global default policies.
+set -euo pipefail
+
+. /etc/tarasec/hotspot.env
+BRIDGE="${TARASEC_BRIDGE}"
+HOTSPOT_ADDR="${TARASEC_HOTSPOT_ADDR}"
+SUBNET="${HOTSPOT_ADDR%.*}.0/24"
+
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+ensure_chain() {
+  local table="$1" chain="$2"
+  if [ "$table" = filter ]; then
+    iptables -N "$chain" 2>/dev/null || true
+    iptables -F "$chain"
+  else
+    iptables -t "$table" -N "$chain" 2>/dev/null || true
+    iptables -t "$table" -F "$chain"
+  fi
+}
+
+ensure_jump() {
+  local table="$1" parent="$2" chain="$3"
+  if [ "$table" = filter ]; then
+    iptables -C "$parent" -j "$chain" 2>/dev/null || iptables -I "$parent" 1 -j "$chain"
+  else
+    iptables -t "$table" -C "$parent" -j "$chain" 2>/dev/null || iptables -t "$table" -I "$parent" 1 -j "$chain"
+  fi
+}
+
+ensure_chain filter TARASEC-HOTSPOT-IN
+ensure_chain filter TARASEC-HOTSPOT-FWD
+ensure_chain nat TARASEC-HOTSPOT-PRE
+ensure_chain nat TARASEC-HOTSPOT-NAT
+
+ensure_jump filter INPUT TARASEC-HOTSPOT-IN
+ensure_jump filter FORWARD TARASEC-HOTSPOT-FWD
+ensure_jump nat PREROUTING TARASEC-HOTSPOT-PRE
+ensure_jump nat POSTROUTING TARASEC-HOTSPOT-NAT
+
+# Local hotspot services. Port 80 is the existing TaraSec hotspot account/login UI.
+iptables -A TARASEC-HOTSPOT-IN -i "$BRIDGE" -s "$SUBNET" -p udp --dport 67 -j ACCEPT
+iptables -A TARASEC-HOTSPOT-IN -i "$BRIDGE" -s "$SUBNET" -p udp --dport 53 -j ACCEPT
+iptables -A TARASEC-HOTSPOT-IN -i "$BRIDGE" -s "$SUBNET" -p tcp --dport 53 -j ACCEPT
+iptables -A TARASEC-HOTSPOT-IN -i "$BRIDGE" -s "$SUBNET" -p tcp --dport 80 -j ACCEPT
+iptables -A TARASEC-HOTSPOT-IN -i "$BRIDGE" -s "$SUBNET" -p tcp --dport 2050 -j ACCEPT
+iptables -A TARASEC-HOTSPOT-IN -j RETURN
+
+# Force ordinary DNS from hotspot clients through the local TaraSec resolver.
+# This makes status.client work even when a phone attempts to use 8.8.8.8/1.1.1.1 directly.
+iptables -t nat -A TARASEC-HOTSPOT-PRE -i "$BRIDGE" -s "$SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_ADDR:53"
+iptables -t nat -A TARASEC-HOTSPOT-PRE -i "$BRIDGE" -s "$SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_ADDR:53"
+iptables -t nat -A TARASEC-HOTSPOT-PRE -j RETURN
+
+# Generic client forwarding/NAT. openNDS remains the per-client authorization layer.
+for upstream in $TARASEC_UPSTREAM_IFACES; do
+  iptables -A TARASEC-HOTSPOT-FWD -i "$BRIDGE" -o "$upstream" -s "$SUBNET" -j ACCEPT
+  iptables -A TARASEC-HOTSPOT-FWD -i "$upstream" -o "$BRIDGE" -d "$SUBNET" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+  iptables -t nat -A TARASEC-HOTSPOT-NAT -s "$SUBNET" -o "$upstream" -j MASQUERADE
+done
+iptables -A TARASEC-HOTSPOT-FWD -j RETURN
+iptables -t nat -A TARASEC-HOTSPOT-NAT -j RETURN
