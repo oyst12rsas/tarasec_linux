@@ -16,12 +16,14 @@ COUNTRY="${TARASEC_COUNTRY:-NO}"
 CHANNEL="${TARASEC_CHANNEL:-6}"
 UPSTREAM_OVERRIDE="${TARASEC_UPSTREAM_IFACES:-}"
 CLIENT_OVERRIDE="${TARASEC_CLIENT_IFACES:-}"
+ASSUME_YES="${TARASEC_ASSUME_YES:-0}"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 THEME_SRC="$REPO_DIR/theme_tarasec.sh"
 UPSTREAM_IFACES=()
 CLIENT_IFACES=()
 WIFI_CLIENT_IFACES=()
 WIRED_CLIENT_IFACES=()
+PLATFORM="Linux"
 
 log(){ echo "[TaraSec] $*"; }
 warn(){ echo "[TaraSec WARNING] $*" >&2; }
@@ -37,8 +39,17 @@ apt_install() {
   apt-get install -y hostapd dnsmasq iptables iw curl ca-certificates
 }
 
+detect_platform() {
+  if grep -qi 'raspberry pi' /proc/device-tree/model 2>/dev/null; then
+    PLATFORM="Raspberry Pi"
+  elif [ -r /etc/os-release ]; then
+    . /etc/os-release
+    PLATFORM="${PRETTY_NAME:-${NAME:-Linux}}"
+  fi
+}
+
 is_wireless() {
-  [ -d "/sys/class/net/$1/wireless" ] || iw dev "$1" info >/dev/null 2>&1
+  [ -d "/sys/class/net/$1/wireless" ] || { command -v iw >/dev/null 2>&1 && iw dev "$1" info >/dev/null 2>&1; }
 }
 
 is_physical_iface() {
@@ -82,6 +93,55 @@ detect_clients() {
     ip link show "$i" >/dev/null 2>&1 || die "Client interface '$i' does not exist"
     if is_wireless "$i"; then WIFI_CLIENT_IFACES+=("$i"); else WIRED_CLIENT_IFACES+=("$i"); fi
   done
+}
+
+show_topology_and_confirm() {
+  local i kind state
+  echo
+  echo "============================================================"
+  echo " TaraSec hotspot proposed setup"
+  echo "============================================================"
+  echo "Platform:              $PLATFORM"
+  echo "Internet/upstream:     ${UPSTREAM_IFACES[*]}"
+  echo "Client-facing:         ${CLIENT_IFACES[*]}"
+  echo "TaraSec bridge:        $BRIDGE ($HOTSPOT_ADDR/$HOTSPOT_CIDR)"
+  echo "Wi-Fi AP interface(s): ${WIFI_CLIENT_IFACES[*]:-(none)}"
+  echo "Wired client port(s):  ${WIRED_CLIENT_IFACES[*]:-(none)}"
+  echo "Wi-Fi SSID:            $SSID"
+  echo
+  echo "Detected physical interfaces:"
+  for i in "${UPSTREAM_IFACES[@]}" "${CLIENT_IFACES[@]}"; do
+    if is_wireless "$i"; then kind="Wi-Fi"; else kind="Ethernet/other"; fi
+    state="$(cat "/sys/class/net/$i/operstate" 2>/dev/null || echo unknown)"
+    if contains "$i" "${UPSTREAM_IFACES[@]}"; then
+      printf '  %-16s %-15s %-10s %s\n' "$i" "$kind" "$state" "KEEP AS INTERNET"
+    else
+      printf '  %-16s %-15s %-10s %s\n' "$i" "$kind" "$state" "USE FOR CLIENTS"
+    fi
+  done
+  echo
+  echo "TaraSec will NOT reconfigure the interface(s) currently carrying"
+  echo "the default Internet route. Client-facing interfaces WILL be"
+  echo "reconfigured and attached to the TaraSec client bridge."
+  echo
+  echo "You can change this later. For example, after adding a USB Ethernet"
+  echo "or Wi-Fi adapter, rerun this installer and confirm the newly detected"
+  echo "topology. For an unusual layout, set TARASEC_UPSTREAM_IFACES and/or"
+  echo "TARASEC_CLIENT_IFACES before rerunning."
+  echo "============================================================"
+  echo
+
+  if [ "$ASSUME_YES" = "1" ]; then
+    log "TARASEC_ASSUME_YES=1: accepting proposed topology."
+    return
+  fi
+  [ -t 0 ] || die "Interactive confirmation required. Run from a terminal, or use TARASEC_ASSUME_YES=1 after reviewing the topology."
+  local answer
+  read -r -p "Use this setup and continue installation? [y/N] " answer
+  case "$answer" in
+    y|Y|yes|YES|Yes) ;;
+    *) echo "Installation cancelled. No TaraSec network changes were made."; exit 0 ;;
+  esac
 }
 
 install_opennds_if_needed() {
@@ -351,9 +411,13 @@ EOF
 }
 
 main() {
-  apt_install
+  detect_platform
   detect_upstreams
   detect_clients
+  show_topology_and_confirm
+
+  # Nothing above this point intentionally changes network configuration.
+  apt_install
   install_opennds_if_needed
   log "Preserving Internet interface(s): ${UPSTREAM_IFACES[*]}"
   log "Using client interface(s): ${CLIENT_IFACES[*]}"
