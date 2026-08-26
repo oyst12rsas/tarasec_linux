@@ -37,7 +37,7 @@ fi
 # The first sighting of a session is counted from zero. Persistent state then
 # prevents recounting that traffic on subsequent runs/restarts.
 python3 - "$TMP_JSON" "$STATE" "$TMP_STATE" >"$TMP_ROWS" <<'PY'
-import json, os, sys
+import json, sys
 src, state_path, out_state = sys.argv[1:]
 with open(src, encoding='utf-8') as f:
     data = json.load(f)
@@ -63,8 +63,6 @@ for mac, c in data.get('clients', {}).items():
         previous = int(old.get(key, 0))
     except (TypeError, ValueError):
         previous = 0
-    # A counter reset within the same key should count from the reset value,
-    # not produce a negative delta.
     delta = total - previous if total >= previous else total
     new[key] = total
     print(f"{key}\t{ip}\t{total}\t{max(0, delta)}")
@@ -82,7 +80,6 @@ while IFS=$'\t' read -r key ip total delta; do
   [ -n "$ip" ] || continue
   clients=$((clients+1))
 
-  # Only IPv4 hotspot addresses can correspond to the legacy session table.
   if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     continue
   fi
@@ -92,15 +89,17 @@ while IFS=$'\t' read -r key ip total delta; do
   }
   [ -n "$username" ] || continue
 
-  # Always keep the active TaraSec session alive while openNDS reports it.
-  "${MYSQL[@]}" -e "UPDATE session SET lastrequest=NOW() WHERE ip='$ip' AND username=HEX('$username') IS NOT NULL AND active=1 AND logouttime IS NULL" >/dev/null 2>&1 || true
+  userhex=$(printf '%s' "$username" | od -An -tx1 | tr -d ' \n')
+  [ -n "$userhex" ] || continue
+
+  # Keep the active TaraSec session alive even in a minute with zero bytes.
+  if ! "${MYSQL[@]}" -e "UPDATE session SET lastrequest=NOW() WHERE ip='$ip' AND username=CONVERT(0x$userhex USING latin1) AND active=1 AND logouttime IS NULL" >/dev/null 2>&1; then
+    errors=$((errors+1))
+    continue
+  fi
 
   [ "${delta:-0}" -gt 0 ] || continue
 
-  # Hex literals avoid quoting problems for usernames. IP and bucket are
-  # generated/validated locally.
-  userhex=$(printf '%s' "$username" | od -An -tx1 | tr -d ' \n')
-  [ -n "$userhex" ] || continue
   mb=$(python3 - "$delta" <<'PY'
 import sys
 print(int(sys.argv[1]) / (1024.0 * 1024.0))
@@ -115,10 +114,6 @@ ON DUPLICATE KEY UPDATE mb=COALESCE(mb,0)+VALUES(mb);
 UPDATE radcheck r
 SET r.mbusage=(SELECT COALESCE(SUM(u.mb),0) FROM userusage u WHERE u.user=r.username)
 WHERE r.username=CONVERT(0x$userhex USING latin1);
-UPDATE session
-SET lastrequest=NOW()
-WHERE ip='$ip' AND username=CONVERT(0x$userhex USING latin1)
-  AND active=1 AND logouttime IS NULL;
 COMMIT;
 SQL
   then
@@ -130,9 +125,9 @@ SQL
   fi
 done <"$TMP_ROWS"
 
-# Commit counter state only after DB processing. This intentionally means a
-# DB failure can retry the same delta next minute; successful rows are normally
-# committed together with state immediately after this loop.
+# Only advance cumulative counters when the DB pass succeeded completely.
+# That makes a failed run retry the same deltas rather than silently losing
+# usage. With the normal single/few-client hotspot this keeps accounting safe.
 if [ "$errors" -eq 0 ]; then
   install -m 0600 "$TMP_STATE" "$STATE"
 fi
