@@ -1,0 +1,143 @@
+#!/bin/bash
+# Synchronize openNDS cumulative per-session byte counters into TaraSec's
+# existing userusage/radcheck accounting model.
+#
+# The state file remembers the last cumulative counter seen for each
+# MAC+openNDS session_start, so each poll writes only the byte delta and does
+# not double count across timer runs or service restarts.
+set -u
+
+DB_NAME="${TARASEC_ACCESS_DB:-taransvar}"
+MYSQL_CNF="${TARASEC_ACCESS_MYSQL_CNF:-/etc/tarasec/access-mysql.cnf}"
+STATE="${TARASEC_USAGE_COUNTER_STATE:-/var/lib/tarasec/opennds-usage-state.json}"
+OUT="${TARASEC_USAGE_STATE:-/run/tarasec-usage-sync.json}"
+
+MYSQL=(mysql)
+if [ -r "$MYSQL_CNF" ]; then MYSQL+=(--defaults-extra-file="$MYSQL_CNF"); fi
+MYSQL+=(--batch --skip-column-names --raw "$DB_NAME")
+
+mkdir -p "$(dirname "$STATE")"
+TMP_JSON=$(mktemp)
+TMP_ROWS=$(mktemp)
+TMP_STATE=$(mktemp)
+trap 'rm -f "$TMP_JSON" "$TMP_ROWS" "$TMP_STATE"' EXIT
+
+if ! command -v ndsctl >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+  printf '{"ok":false,"clients":0,"accounted":0,"bytes":0,"errors":1,"reason":"missing_ndsctl_or_python"}\n' >"$OUT"
+  exit 1
+fi
+
+if ! ndsctl json >"$TMP_JSON" 2>/dev/null; then
+  printf '{"ok":false,"clients":0,"accounted":0,"bytes":0,"errors":1,"reason":"ndsctl_failed"}\n' >"$OUT"
+  exit 1
+fi
+
+# Output one row per authenticated client:
+# state-key<TAB>ip<TAB>current-total-bytes<TAB>delta-bytes
+# The first sighting of a session is counted from zero. Persistent state then
+# prevents recounting that traffic on subsequent runs/restarts.
+python3 - "$TMP_JSON" "$STATE" "$TMP_STATE" >"$TMP_ROWS" <<'PY'
+import json, os, sys
+src, state_path, out_state = sys.argv[1:]
+with open(src, encoding='utf-8') as f:
+    data = json.load(f)
+try:
+    with open(state_path, encoding='utf-8') as f:
+        old = json.load(f)
+except Exception:
+    old = {}
+new = {}
+for mac, c in data.get('clients', {}).items():
+    if c.get('state') != 'Authenticated':
+        continue
+    ip = str(c.get('ip', ''))
+    session_start = str(c.get('session_start', ''))
+    try:
+        down = int(c.get('download_this_session') or 0)
+        up = int(c.get('upload_this_session') or 0)
+    except (TypeError, ValueError):
+        continue
+    total = max(0, down) + max(0, up)
+    key = f"{mac}|{session_start}"
+    try:
+        previous = int(old.get(key, 0))
+    except (TypeError, ValueError):
+        previous = 0
+    # A counter reset within the same key should count from the reset value,
+    # not produce a negative delta.
+    delta = total - previous if total >= previous else total
+    new[key] = total
+    print(f"{key}\t{ip}\t{total}\t{max(0, delta)}")
+with open(out_state, 'w', encoding='utf-8') as f:
+    json.dump(new, f, separators=(',', ':'))
+PY
+
+clients=0
+accounted=0
+bytes=0
+errors=0
+bucket=$(date '+%Y-%m-%d %H:%M')
+
+while IFS=$'\t' read -r key ip total delta; do
+  [ -n "$ip" ] || continue
+  clients=$((clients+1))
+
+  # Only IPv4 hotspot addresses can correspond to the legacy session table.
+  if ! [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    continue
+  fi
+
+  username=$("${MYSQL[@]}" -e "SELECT s.username FROM session s WHERE s.ip='$ip' AND s.active=1 AND s.logouttime IS NULL ORDER BY s.logintime DESC LIMIT 1" 2>/dev/null | head -1) || {
+    errors=$((errors+1)); continue;
+  }
+  [ -n "$username" ] || continue
+
+  # Always keep the active TaraSec session alive while openNDS reports it.
+  "${MYSQL[@]}" -e "UPDATE session SET lastrequest=NOW() WHERE ip='$ip' AND username=HEX('$username') IS NOT NULL AND active=1 AND logouttime IS NULL" >/dev/null 2>&1 || true
+
+  [ "${delta:-0}" -gt 0 ] || continue
+
+  # Hex literals avoid quoting problems for usernames. IP and bucket are
+  # generated/validated locally.
+  userhex=$(printf '%s' "$username" | od -An -tx1 | tr -d ' \n')
+  [ -n "$userhex" ] || continue
+  mb=$(python3 - "$delta" <<'PY'
+import sys
+print(int(sys.argv[1]) / (1024.0 * 1024.0))
+PY
+)
+
+  if "${MYSQL[@]}" >/dev/null 2>&1 <<SQL
+START TRANSACTION;
+INSERT INTO userusage (user,ip,yyyymmddhh,mb)
+VALUES (CONVERT(0x$userhex USING latin1),'$ip','$bucket',$mb)
+ON DUPLICATE KEY UPDATE mb=COALESCE(mb,0)+VALUES(mb);
+UPDATE radcheck r
+SET r.mbusage=(SELECT COALESCE(SUM(u.mb),0) FROM userusage u WHERE u.user=r.username)
+WHERE r.username=CONVERT(0x$userhex USING latin1);
+UPDATE session
+SET lastrequest=NOW()
+WHERE ip='$ip' AND username=CONVERT(0x$userhex USING latin1)
+  AND active=1 AND logouttime IS NULL;
+COMMIT;
+SQL
+  then
+    accounted=$((accounted+1))
+    bytes=$((bytes+delta))
+  else
+    errors=$((errors+1))
+    logger -t tarasec-usage "failed accounting for $ip/$username"
+  fi
+done <"$TMP_ROWS"
+
+# Commit counter state only after DB processing. This intentionally means a
+# DB failure can retry the same delta next minute; successful rows are normally
+# committed together with state immediately after this loop.
+if [ "$errors" -eq 0 ]; then
+  install -m 0600 "$TMP_STATE" "$STATE"
+fi
+
+ok=true
+[ "$errors" -eq 0 ] || ok=false
+printf '{"ok":%s,"clients":%d,"accounted":%d,"bytes":%d,"errors":%d}\n' "$ok" "$clients" "$accounted" "$bytes" "$errors" >"$OUT"
+[ "$errors" -eq 0 ]
