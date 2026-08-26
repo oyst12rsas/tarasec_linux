@@ -1,0 +1,54 @@
+#!/bin/bash
+# Keep openNDS authenticated clients synchronized with TaraSec's existing access table.
+# Missing row, hasaccess != 1, or DB/checker failure => fail closed and deauthenticate.
+set -u
+
+CHECKER="${TARASEC_ACCESS_CHECKER:-/usr/local/sbin/tarasec-access-check}"
+OUT="${TARASEC_ACCESS_STATE:-/run/tarasec-access-enforcement.json}"
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
+
+checked=0
+revoked=0
+errors=0
+
+if ! command -v ndsctl >/dev/null 2>&1 || [ ! -x "$CHECKER" ]; then
+  printf '{"ok":false,"checked":0,"revoked":0,"errors":1,"reason":"missing_ndsctl_or_checker"}\n' >"$OUT"
+  exit 1
+fi
+
+if ! ndsctl json >"$TMP" 2>/dev/null; then
+  printf '{"ok":false,"checked":0,"revoked":0,"errors":1,"reason":"ndsctl_failed"}\n' >"$OUT"
+  exit 1
+fi
+
+# Python is used only to safely parse ndsctl JSON. Output: MAC<TAB>IP<TAB>STATE
+while IFS=$'\t' read -r mac ip state; do
+  [ -n "$mac" ] || continue
+  [ "$state" = "Authenticated" ] || continue
+  checked=$((checked+1))
+
+  if "$CHECKER" "$ip"; then
+    continue
+  fi
+
+  if ndsctl deauth "$mac" >/dev/null 2>&1; then
+    revoked=$((revoked+1))
+    logger -t tarasec-access "revoked $mac/$ip: access table no longer allows client"
+  else
+    errors=$((errors+1))
+    logger -t tarasec-access "FAILED to revoke $mac/$ip"
+  fi
+done < <(python3 - "$TMP" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as f:
+    data=json.load(f)
+for mac, c in data.get('clients', {}).items():
+    print(f"{mac}\t{c.get('ip','')}\t{c.get('state','')}")
+PY
+)
+
+ok=true
+[ "$errors" -eq 0 ] || ok=false
+printf '{"ok":%s,"checked":%d,"revoked":%d,"errors":%d}\n' "$ok" "$checked" "$revoked" "$errors" >"$OUT"
+[ "$errors" -eq 0 ]
