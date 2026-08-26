@@ -1,9 +1,11 @@
 #!/bin/bash
 # Keep openNDS authenticated clients synchronized with TaraSec's existing access table.
+# First refresh access from active sessions/subscriptions, then enforce it in openNDS.
 # Missing row, hasaccess != 1, or DB/checker failure => fail closed and deauthenticate.
 set -u
 
 CHECKER="${TARASEC_ACCESS_CHECKER:-/usr/local/sbin/tarasec-access-check}"
+REFRESHER="${TARASEC_ACCESS_REFRESHER:-/usr/local/sbin/tarasec-access-refresh}"
 OUT="${TARASEC_ACCESS_STATE:-/run/tarasec-access-enforcement.json}"
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
@@ -11,14 +13,22 @@ trap 'rm -f "$TMP"' EXIT
 checked=0
 revoked=0
 errors=0
+refresh_ok=true
+
+if [ -x "$REFRESHER" ]; then
+  if ! "$REFRESHER"; then
+    refresh_ok=false
+    errors=$((errors+1))
+  fi
+fi
 
 if ! command -v ndsctl >/dev/null 2>&1 || [ ! -x "$CHECKER" ]; then
-  printf '{"ok":false,"checked":0,"revoked":0,"errors":1,"reason":"missing_ndsctl_or_checker"}\n' >"$OUT"
+  printf '{"ok":false,"refresh_ok":%s,"checked":0,"revoked":0,"errors":%d,"reason":"missing_ndsctl_or_checker"}\n' "$refresh_ok" "$((errors+1))" >"$OUT"
   exit 1
 fi
 
 if ! ndsctl json >"$TMP" 2>/dev/null; then
-  printf '{"ok":false,"checked":0,"revoked":0,"errors":1,"reason":"ndsctl_failed"}\n' >"$OUT"
+  printf '{"ok":false,"refresh_ok":%s,"checked":0,"revoked":0,"errors":%d,"reason":"ndsctl_failed"}\n' "$refresh_ok" "$((errors+1))" >"$OUT"
   exit 1
 fi
 
@@ -50,5 +60,5 @@ PY
 
 ok=true
 [ "$errors" -eq 0 ] || ok=false
-printf '{"ok":%s,"checked":%d,"revoked":%d,"errors":%d}\n' "$ok" "$checked" "$revoked" "$errors" >"$OUT"
+printf '{"ok":%s,"refresh_ok":%s,"checked":%d,"revoked":%d,"errors":%d}\n' "$ok" "$refresh_ok" "$checked" "$revoked" "$errors" >"$OUT"
 [ "$errors" -eq 0 ]
