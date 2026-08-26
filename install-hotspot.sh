@@ -19,6 +19,8 @@ CLIENT_OVERRIDE="${TARASEC_CLIENT_IFACES:-}"
 ASSUME_YES="${TARASEC_ASSUME_YES:-0}"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 THEME_SRC="$REPO_DIR/theme_tarasec.sh"
+ACCESS_CHECK_SRC="$REPO_DIR/tarasec-access-check"
+ACCESS_ENFORCE_SRC="$REPO_DIR/tarasec-access-enforce"
 UPSTREAM_IFACES=()
 CLIENT_IFACES=()
 WIFI_CLIENT_IFACES=()
@@ -36,7 +38,7 @@ command -v systemctl >/dev/null || die "systemd is required"
 apt_install() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y hostapd dnsmasq iptables iw curl ca-certificates
+  apt-get install -y hostapd dnsmasq iptables iw curl ca-certificates python3 default-mysql-client
 }
 
 detect_platform() {
@@ -85,9 +87,7 @@ detect_clients() {
       CLIENT_IFACES+=("$i")
     done
   fi
-
   [ "${#CLIENT_IFACES[@]}" -gt 0 ] || die "No spare physical interface found for hotspot clients. Add another Ethernet/Wi-Fi adapter or set TARASEC_CLIENT_IFACES explicitly."
-
   for i in "${CLIENT_IFACES[@]}"; do
     contains "$i" "${UPSTREAM_IFACES[@]}" && die "Refusing to repurpose active Internet interface '$i' as a client interface"
     ip link show "$i" >/dev/null 2>&1 || die "Client interface '$i' does not exist"
@@ -96,7 +96,7 @@ detect_clients() {
 }
 
 show_topology_and_confirm() {
-  local i kind state
+  local i kind state answer
   echo
   echo "============================================================"
   echo " TaraSec hotspot proposed setup"
@@ -130,18 +130,13 @@ show_topology_and_confirm() {
   echo "TARASEC_CLIENT_IFACES before rerunning."
   echo "============================================================"
   echo
-
   if [ "$ASSUME_YES" = "1" ]; then
     log "TARASEC_ASSUME_YES=1: accepting proposed topology."
     return
   fi
   [ -t 0 ] || die "Interactive confirmation required. Run from a terminal, or use TARASEC_ASSUME_YES=1 after reviewing the topology."
-  local answer
   read -r -p "Use this setup and continue installation? [y/N] " answer
-  case "$answer" in
-    y|Y|yes|YES|Yes) ;;
-    *) echo "Installation cancelled. No TaraSec network changes were made."; exit 0 ;;
-  esac
+  case "$answer" in y|Y|yes|YES|Yes) ;; *) echo "Installation cancelled. No TaraSec network changes were made."; exit 0 ;; esac
 }
 
 install_opennds_if_needed() {
@@ -218,13 +213,11 @@ configure_hostapd() {
   systemctl disable --now hostapd.service 2>/dev/null || true
   rm -rf /etc/tarasec/hostapd
   mkdir -p /etc/tarasec/hostapd
-
   if [ "${#WIFI_CLIENT_IFACES[@]}" -eq 0 ]; then
     rm -f /etc/systemd/system/tarasec-hotspot-hostapd.service
     log "No spare Wi-Fi interface: clients will connect through wired interface(s)/external APs."
     return
   fi
-
   for i in "${WIFI_CLIENT_IFACES[@]}"; do
     cat >"/etc/tarasec/hostapd/$i.conf" <<EOF
 interface=$i
@@ -240,7 +233,6 @@ auth_algs=1
 wpa=0
 EOF
   done
-
   cat >/usr/local/sbin/tarasec-hotspot-hostapd <<'EOF'
 #!/bin/bash
 set -e
@@ -367,12 +359,38 @@ EOF
   systemctl enable opennds
 }
 
+install_access_control() {
+  [ -f "$ACCESS_CHECK_SRC" ] || die "Missing $ACCESS_CHECK_SRC"
+  [ -f "$ACCESS_ENFORCE_SRC" ] || die "Missing $ACCESS_ENFORCE_SRC"
+  install -m 0755 "$ACCESS_CHECK_SRC" /usr/local/sbin/tarasec-access-check
+  install -m 0755 "$ACCESS_ENFORCE_SRC" /usr/local/sbin/tarasec-access-enforce
+
+  # Older pilot installs used a separate access timer. The normal installer
+  # now runs enforcement inside the existing one-minute health loop.
+  systemctl disable --now tarasec-access-enforce.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/tarasec-access-enforce.timer
+  rm -f /etc/systemd/system/tarasec-access-enforce.service
+}
+
 install_health_check() {
   cat >/usr/local/sbin/tarasec-hotspot-health <<'EOF'
 #!/bin/bash
 set -u
 . /etc/tarasec/hotspot.env
 bool(){ if eval "$1" >/dev/null 2>&1; then printf true; else printf false; fi; }
+
+# Access enforcement is part of the same per-minute health cycle.
+ACCESS_OK=false
+ACCESS_CHECKED=0
+ACCESS_REVOKED=0
+ACCESS_ERRORS=1
+if /usr/local/sbin/tarasec-access-enforce >/dev/null 2>&1; then ACCESS_OK=true; fi
+if [ -r /run/tarasec-access-enforcement.json ]; then
+  ACCESS_CHECKED=$(sed -n 's/.*"checked":\([0-9]*\).*/\1/p' /run/tarasec-access-enforcement.json | head -1); ACCESS_CHECKED=${ACCESS_CHECKED:-0}
+  ACCESS_REVOKED=$(sed -n 's/.*"revoked":\([0-9]*\).*/\1/p' /run/tarasec-access-enforcement.json | head -1); ACCESS_REVOKED=${ACCESS_REVOKED:-0}
+  ACCESS_ERRORS=$(sed -n 's/.*"errors":\([0-9]*\).*/\1/p' /run/tarasec-access-enforcement.json | head -1); ACCESS_ERRORS=${ACCESS_ERRORS:-1}
+fi
+
 DHCP=$(bool "systemctl is-active --quiet tarasec-hotspot-dnsmasq.service")
 NDS=$(bool "systemctl is-active --quiet opennds")
 IFACE=$(bool "ip -4 addr show dev $TARASEC_BRIDGE | grep -q '$TARASEC_HOTSPOT_ADDR/'")
@@ -384,14 +402,14 @@ WIFI_CLIENTS=0
 for w in $TARASEC_WIFI_CLIENT_IFACES; do n=$(iw dev "$w" station dump 2>/dev/null | grep -c '^Station ' || true); WIFI_CLIENTS=$((WIFI_CLIENTS+n)); done
 NDS_CLIENTS=$(ndsctl json 2>/dev/null | sed -n 's/.*"client_list_length":"\([0-9]*\)".*/\1/p' | head -1); NDS_CLIENTS=${NDS_CLIENTS:-0}
 STATE=OK
-[ "$AP" = true ] && [ "$DHCP" = true ] && [ "$NDS" = true ] && [ "$IFACE" = true ] && [ "$UP" = true ] && [ "$PORTAL" = true ] || STATE=FAILED
+[ "$AP" = true ] && [ "$DHCP" = true ] && [ "$NDS" = true ] && [ "$IFACE" = true ] && [ "$UP" = true ] && [ "$PORTAL" = true ] && [ "$ACCESS_ERRORS" -eq 0 ] || STATE=FAILED
 [ "$STATE" = OK ] && [ "$WIFI_CLIENTS" -gt 0 ] && [ "$NDS_CLIENTS" -eq 0 ] && STATE=DEGRADED
-printf '{"status":"%s","ap_up":%s,"dhcp_ok":%s,"opennds_ok":%s,"interface_ok":%s,"upstream_ok":%s,"portal_listener_ok":%s,"wifi_associated":%s,"opennds_clients":%s,"upstreams":"%s","clients":"%s"}\n' "$STATE" "$AP" "$DHCP" "$NDS" "$IFACE" "$UP" "$PORTAL" "$WIFI_CLIENTS" "$NDS_CLIENTS" "$TARASEC_UPSTREAM_IFACES" "$TARASEC_CLIENT_IFACES"
+printf '{"status":"%s","ap_up":%s,"dhcp_ok":%s,"opennds_ok":%s,"interface_ok":%s,"upstream_ok":%s,"portal_listener_ok":%s,"wifi_associated":%s,"opennds_clients":%s,"access_ok":%s,"access_checked":%s,"access_revoked":%s,"access_errors":%s,"upstreams":"%s","clients":"%s"}\n' "$STATE" "$AP" "$DHCP" "$NDS" "$IFACE" "$UP" "$PORTAL" "$WIFI_CLIENTS" "$NDS_CLIENTS" "$ACCESS_OK" "$ACCESS_CHECKED" "$ACCESS_REVOKED" "$ACCESS_ERRORS" "$TARASEC_UPSTREAM_IFACES" "$TARASEC_CLIENT_IFACES"
 EOF
   chmod 755 /usr/local/sbin/tarasec-hotspot-health
   cat >/etc/systemd/system/tarasec-hotspot-health.service <<EOF
 [Unit]
-Description=TaraSec hotspot health snapshot
+Description=TaraSec hotspot health and access enforcement snapshot
 After=opennds.service
 [Service]
 Type=oneshot
@@ -399,7 +417,7 @@ ExecStart=/bin/sh -c '/usr/local/sbin/tarasec-hotspot-health > /run/tarasec-hots
 EOF
   cat >/etc/systemd/system/tarasec-hotspot-health.timer <<EOF
 [Unit]
-Description=Run TaraSec hotspot health check every minute
+Description=Run TaraSec hotspot health/access check every minute
 [Timer]
 OnBootSec=1min
 OnUnitActiveSec=1min
@@ -408,6 +426,22 @@ AccuracySec=5s
 WantedBy=timers.target
 EOF
   systemctl enable tarasec-hotspot-health.timer
+}
+
+restart_opennds_clean() {
+  systemctl stop opennds.service 2>/dev/null || true
+  # openNDS can briefly report itself as running after systemd considers it stopped.
+  # Give its helper/lock cleanup time to finish, then retry startup if necessary.
+  local n
+  for n in $(seq 1 20); do
+    pgrep -x opennds >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  for n in 1 2 3; do
+    if systemctl start opennds.service; then return 0; fi
+    sleep 5
+  done
+  return 1
 }
 
 main() {
@@ -430,20 +464,22 @@ main() {
   configure_dnsmasq
   configure_firewall
   configure_opennds
+  install_access_control
   install_health_check
   systemctl daemon-reload
   systemctl restart tarasec-hotspot-interface.service
   systemctl restart tarasec-hotspot-firewall.service
   systemctl restart tarasec-hotspot-dnsmasq.service
   if [ "${#WIFI_CLIENT_IFACES[@]}" -gt 0 ]; then systemctl restart tarasec-hotspot-hostapd.service; fi
-  systemctl restart opennds.service
-  systemctl start tarasec-hotspot-health.timer
+  restart_opennds_clean
+  systemctl restart tarasec-hotspot-health.timer
   sleep 3
   /usr/local/sbin/tarasec-hotspot-health || true
   echo
   log "Installation complete. Gateway=$HOTSPOT_ADDR bridge=$BRIDGE"
   log "Upstream preserved: ${UPSTREAM_IFACES[*]}"
   log "Client side: ${CLIENT_IFACES[*]}"
+  log "Access enforcement: synchronized with TaraSec access table every minute"
   log "Health: cat /run/tarasec-hotspot-health.json"
 }
 
