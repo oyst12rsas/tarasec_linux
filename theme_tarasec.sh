@@ -6,7 +6,8 @@ title="TaraSec Hotspot"
 download_data_files() { :; }
 download_image_files() { :; }
 
-generate_splash_sequence() { click_to_continue; }
+# Do not force an extra "Continue" page. Decide access immediately.
+generate_splash_sequence() { access_decision_page; }
 
 header() {
     echo "<!doctype html>
@@ -33,22 +34,7 @@ access_allowed() {
 hotspot_web_base() {
     local host="${gatewayaddress%%:*}"
     [ -n "$host" ] || host="192.168.50.1"
-    # Port 80 is intentionally intercepted by openNDS for captive clients.
-    # Subscriber login therefore uses the dedicated local Apache listener.
     printf 'http://%s:8080/hotspot' "$host"
-}
-
-click_to_continue() {
-    if [ "$continue" = "clicked" ]; then access_decision_page; footer; fi
-    continue_form; footer
-}
-
-continue_form() {
-    echo "<h2>Welcome to TaraSec WiFi</h2><p class=\"lead\">You are connected to <b>$client_zone</b>. Continue to check Internet access for this device.</p>
-<div class=\"note\"><b>What TaraSec is doing</b><br>The hotspot provides Internet connectivity and can use network-level security information to help identify potentially infected or abusive traffic. A warning does not by itself mean a person has committed an offence; devices can become infected accidentally.</div>
-<div class=\"research\"><b>Privacy and research</b><br>Normal hotspot operation requires technical connection information such as addresses and session data. Optional TaraSec research or precise location sharing must be presented separately and is not enabled merely by pressing Continue here.</div>
-<form action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\"><input type=\"hidden\" name=\"continue\" value=\"clicked\">$custom_inputs<input class=\"btn\" type=\"submit\" value=\"Check access\"></form>"
-    read_terms; footer
 }
 
 access_decision_page() {
@@ -59,34 +45,44 @@ denied_page() {
     local loginbase
     loginbase="$(hotspot_web_base)"
     echo "<div class=\"bad\">Internet access is not active</div><p>This device does not currently have access on this hotspot.</p>
-<div class=\"note\"><b>Already have a hotspot account?</b><br>Log in below. The existing hotspot subscription and quota rules decide whether Internet access is granted.</div>
-<form action=\"$loginbase/portal_login.php\" method=\"post\">
+<div class=\"note\"><b>Already have a hotspot account?</b><br>Log in below. Your subscription or quota determines whether Internet access is granted.</div>
+<form id=\"tslogin\" action=\"$loginbase/portal_login.php\" method=\"post\">
 <input type=\"hidden\" name=\"client_ip\" value=\"$clientip\">
 <input type=\"hidden\" name=\"fas\" value=\"$fas\">
 $custom_inputs
 <label for=\"tsuser\"><b>Username</b></label><input id=\"tsuser\" class=\"field\" name=\"name\" autocomplete=\"username\" required>
 <label for=\"tspass\"><b>Password</b></label><input id=\"tspass\" class=\"field\" name=\"pass\" type=\"password\" autocomplete=\"current-password\" required>
+<label class=\"small\" style=\"display:block;margin:0 0 12px\"><input id=\"tsremember\" type=\"checkbox\" checked> Remember username on this device</label>
 <input class=\"btn\" type=\"submit\" value=\"Log in\"></form>
-<div class=\"note\"><b>Need access?</b><br>If this hotspot charges for access, use the hotspot's payment or access instructions. After a payment or account change has been registered, return here and check access again.</div>
-<form action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\"><input type=\"hidden\" name=\"continue\" value=\"clicked\">$custom_inputs<input class=\"btn btn2\" type=\"submit\" value=\"Check access again\"></form>"
+<script>(function(){try{var f=document.getElementById('tslogin'),u=document.getElementById('tsuser'),r=document.getElementById('tsremember'),k='tarasec_hotspot_username';var v=localStorage.getItem(k);if(v){u.value=v;}f.addEventListener('submit',function(){if(r.checked){localStorage.setItem(k,u.value);}else{localStorage.removeItem(k);}});}catch(e){}})();</script>
+<div class=\"note\"><b>Need access?</b><br>Available plans and payment options are shown below when online payment is configured. You can also ask the hotspot operator for access.</div>"
     read_terms
 }
 
 thankyou_page() {
     if [ -z "$custom" ]; then customhtml=""; else customhtml="<input type=\"hidden\" name=\"custom\" value=\"$custom\">"; fi
-    echo "<h2>Access confirmed</h2><p>This device has active TaraSec hotspot access. Press the button below to authorize it in openNDS and open Internet access.</p>
-<div class=\"note\"><b>Security notice</b><br>TaraSec may warn users or hotspot operators when network behaviour suggests an infected device. The aim is to help clean devices and reduce harmful traffic, not to label ordinary users as criminals.</div>
-<form action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\">$customhtml$custom_passthrough<input type=\"hidden\" name=\"landing\" value=\"yes\"><input class=\"btn\" type=\"submit\" value=\"Enable Internet access\"></form>"
-    read_terms; footer
+    # Authorization still goes through openNDS, but there is no user-facing
+    # confirmation button. JavaScript submits immediately; the button is only
+    # a fallback for captive mini-browsers that block scripts.
+    echo "<h2>Connecting&hellip;</h2><p>If this page remains visible, use the button below.</p>
+<form id=\"tsauth\" action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\">$customhtml$custom_passthrough<input type=\"hidden\" name=\"landing\" value=\"yes\"><input class=\"btn\" type=\"submit\" value=\"Continue\"></form>
+<script>document.getElementById('tsauth').submit();</script>"
+    footer
 }
 
 landing_page() {
-    originurl=$(printf "${originurl//%/\\x}"); gatewayurl=$(printf "${gatewayurl//%/\\x}")
+    originurl=$(printf "${originurl//%/\\x}")
     configure_log_location; . "$mountpoint/ndscids/ndsinfo"; auth_log
     if [ "$ndsstatus" = "authenticated" ]; then
-        echo "<div class=\"ok\">Internet access enabled</div><p>Your device is now authorized on this TaraSec hotspot.</p><p>You can return to your browser or other apps.</p><form><input class=\"btn\" type=\"button\" value=\"Hotspot status\" onClick=\"location.href='$gatewayurl'\"></form>"
+        local loginbase
+        loginbase="$(hotspot_web_base)"
+        # Normal success should disappear from view. A plain HTTP connectivity
+        # request lets the captive browser verify that Internet is open and
+        # normally close itself. TaraSec status/logout remains available locally.
+        echo "<meta http-equiv=\"refresh\" content=\"0;url=http://neverssl.com/\"><script>location.replace('http://neverssl.com/');</script>
+<div class=\"ok\">Internet access enabled</div><p>You can close this window.</p><p><a href=\"$loginbase/portal_status.php\">Hotspot status / Log out</a></p>"
     else
-        echo "<div class=\"bad\">Connection was not authorized</div><p>The request may have timed out. Please return to the hotspot page and try again.</p><form><input class=\"btn\" type=\"button\" value=\"Try again\" onClick=\"location.href='http://$gatewayfqdn'\"></form>"
+        echo "<div class=\"bad\">Connection was not authorized</div><p>The request may have timed out. Please try again.</p><form><input class=\"btn\" type=\"button\" value=\"Try again\" onClick=\"location.href='http://$gatewayfqdn'\"></form>"
     fi
     footer
 }
