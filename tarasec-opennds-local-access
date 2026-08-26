@@ -18,5 +18,8 @@ nft list chain $TABLE $CHAIN >/dev/null 2>&1 || {
 }
 
 if ! nft list chain $TABLE $CHAIN | grep -qE "tcp dport ${PORT} .*accept"; then
-  nft insert rule $TABLE $CHAIN tcp dport "$PORT" accept comment 'TaraSec captive login'
+  # Insert before openNDS' catch-all reject, but do not bypass its invalid-state
+  # protection: only NEW/ESTABLISHED TCP connections to the captive-login port
+  # are accepted here.
+  nft insert rule $TABLE $CHAIN ct state new,established tcp dport "$PORT" accept
 fi
