@@ -6,8 +6,16 @@ title="TaraSec Hotspot"
 download_data_files() { :; }
 download_image_files() { :; }
 
-# Do not force an extra "Continue" page. Decide access immediately.
-generate_splash_sequence() { access_decision_page; }
+# openNDS sends status=authenticated when an already-authorized client opens
+# the gateway/status URL. Show TaraSec's own status/logout UI in that case.
+# Otherwise decide access immediately without an extra Continue page.
+generate_splash_sequence() {
+    if [ "${status:-}" = "authenticated" ]; then
+        authenticated_status_page
+    else
+        access_decision_page
+    fi
+}
 
 header() {
     echo "<!doctype html>
@@ -23,7 +31,7 @@ header() {
 
 footer() {
     year=$(date +'%Y')
-    echo "<div class=\"small\">TaraSec / Taransvar &middot; $year<br>This page is served locally by the hotspot before Internet access is enabled.</div></div></div></body></html>"
+    echo "<div class=\"small\">TaraSec / Taransvar &middot; $year<br>This page is served locally by the hotspot.</div></div></div></body></html>"
     exit 0
 }
 
@@ -35,6 +43,15 @@ hotspot_web_base() {
     local host="${gatewayaddress%%:*}"
     [ -n "$host" ] || host="192.168.50.1"
     printf 'http://%s:8080/hotspot' "$host"
+}
+
+authenticated_status_page() {
+    local loginbase
+    loginbase="$(hotspot_web_base)"
+    echo "<div class=\"ok\">You are already logged in and have access to the Internet</div>
+<p>This device currently has active TaraSec hotspot access.</p>
+<p><a class=\"btn\" style=\"display:block;text-align:center;text-decoration:none;background:#a43737\" href=\"$loginbase/portal_status.php\">Hotspot status / Log out</a></p>"
+    footer
 }
 
 access_decision_page() {
@@ -61,9 +78,6 @@ $custom_inputs
 
 thankyou_page() {
     if [ -z "$custom" ]; then customhtml=""; else customhtml="<input type=\"hidden\" name=\"custom\" value=\"$custom\">"; fi
-    # Authorization still goes through openNDS, but there is no user-facing
-    # confirmation button. JavaScript submits immediately; the button is only
-    # a fallback for captive mini-browsers that block scripts.
     echo "<h2>Connecting&hellip;</h2><p>If this page remains visible, use the button below.</p>
 <form id=\"tsauth\" action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\">$customhtml$custom_passthrough<input type=\"hidden\" name=\"landing\" value=\"yes\"><input class=\"btn\" type=\"submit\" value=\"Continue\"></form>
 <script>document.getElementById('tsauth').submit();</script>"
@@ -76,9 +90,6 @@ landing_page() {
     if [ "$ndsstatus" = "authenticated" ]; then
         local loginbase
         loginbase="$(hotspot_web_base)"
-        # Normal success should disappear from view. A plain HTTP connectivity
-        # request lets the captive browser verify that Internet is open and
-        # normally close itself. TaraSec status/logout remains available locally.
         echo "<meta http-equiv=\"refresh\" content=\"0;url=http://neverssl.com/\"><script>location.replace('http://neverssl.com/');</script>
 <div class=\"ok\">Internet access enabled</div><p>You can close this window.</p><p><a href=\"$loginbase/portal_status.php\">Hotspot status / Log out</a></p>"
     else
