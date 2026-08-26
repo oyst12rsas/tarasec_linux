@@ -6,15 +6,20 @@ title="TaraSec Hotspot"
 download_data_files() { :; }
 download_image_files() { :; }
 
-# openNDS sends status=authenticated when an already-authorized client opens
-# the gateway/status URL. Show TaraSec's own status/logout UI in that case.
-# Otherwise decide access immediately without an extra Continue page.
+# openNDS documents status=authenticated for an already-authorized client
+# opening the gateway/status URL. Different 10.x paths expose that state in
+# different shell variables, so recognise all forms we have seen rather than
+# falling through to the normal captive-login page.
 generate_splash_sequence() {
-    if [ "${status:-}" = "authenticated" ]; then
-        authenticated_status_page
-    else
-        access_decision_page
-    fi
+    local raw="${status:-} ${ndsstatus:-} ${querystring:-} ${query_string:-} ${fas:-} ${fasparams:-} ${fasparam:-}"
+    case "$raw" in
+        *authenticated*|*status%3Dauthenticated*|*status=authenticated*)
+            authenticated_status_page
+            ;;
+        *)
+            access_decision_page
+            ;;
+    esac
 }
 
 header() {
@@ -31,7 +36,7 @@ header() {
 
 footer() {
     year=$(date +'%Y')
-    echo "<div class=\"small\">TaraSec / Taransvar &middot; $year<br>This page is served locally by the hotspot.</div></div></div></body></html>"
+    echo "<div class=\"small\">TaraSec / Taransvar &middot; $year<br>This page is served locally by the hotspot before Internet access is enabled.</div></div></div></body></html>"
     exit 0
 }
 
