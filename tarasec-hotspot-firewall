@@ -59,11 +59,13 @@ ensure_jump filter FORWARD TARASEC-HOTSPOT-FWD
 ensure_jump nat PREROUTING TARASEC-HOTSPOT-PRE
 ensure_jump nat POSTROUTING TARASEC-HOTSPOT-NAT
 
-# Local hotspot services. Port 80 is the existing TaraSec hotspot account/login UI.
+# Local hotspot services. Port 80 remains the normal web/back-office listener,
+# while 8080 is dedicated to subscriber login before openNDS authentication.
 iptables -A TARASEC-HOTSPOT-IN -i "$CLIENT_IF" -s "$SUBNET" -p udp --dport 67 -j ACCEPT
 iptables -A TARASEC-HOTSPOT-IN -i "$CLIENT_IF" -s "$SUBNET" -p udp --dport 53 -j ACCEPT
 iptables -A TARASEC-HOTSPOT-IN -i "$CLIENT_IF" -s "$SUBNET" -p tcp --dport 53 -j ACCEPT
 iptables -A TARASEC-HOTSPOT-IN -i "$CLIENT_IF" -s "$SUBNET" -p tcp --dport 80 -j ACCEPT
+iptables -A TARASEC-HOTSPOT-IN -i "$CLIENT_IF" -s "$SUBNET" -p tcp --dport 8080 -j ACCEPT
 iptables -A TARASEC-HOTSPOT-IN -i "$CLIENT_IF" -s "$SUBNET" -p tcp --dport 2050 -j ACCEPT
 iptables -A TARASEC-HOTSPOT-IN -j RETURN
 
