@@ -35,8 +35,10 @@ header() {
 }
 
 footer() {
+    local loginbase
+    loginbase="$(hotspot_web_base)"
     year=$(date +'%Y')
-    echo "<div class=\"small\">TaraSec / Taransvar &middot; $year<br>This page is served locally by the hotspot before Internet access is enabled.</div></div></div></body></html>"
+    echo "<div class=\"small\"><a href=\"$loginbase/portal_status.php\">Hotspot status / Log out</a><br>TaraSec / Taransvar &middot; $year<br>This page is served locally by the hotspot before Internet access is enabled.</div></div></div></body></html>"
     exit 0
 }
 
