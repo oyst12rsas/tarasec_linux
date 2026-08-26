@@ -51,6 +51,10 @@ ensure_jump() {
 
 ensure_chain filter TARASEC-HOTSPOT-IN
 ensure_chain filter TARASEC-HOTSPOT-FWD
+# Dynamic per-client counter rules are populated by tarasec-usage-sync.
+# Recreating the firewall resets these counters intentionally; the usage sync
+# detects counter resets and continues from the new value without going negative.
+ensure_chain filter TARASEC-HOTSPOT-COUNT
 ensure_chain nat TARASEC-HOTSPOT-PRE
 ensure_chain nat TARASEC-HOTSPOT-NAT
 
@@ -73,6 +77,12 @@ iptables -A TARASEC-HOTSPOT-IN -j RETURN
 iptables -t nat -A TARASEC-HOTSPOT-PRE -i "$CLIENT_IF" -s "$SUBNET" -p udp --dport 53 -j DNAT --to-destination "$HOTSPOT_ADDR:53"
 iptables -t nat -A TARASEC-HOTSPOT-PRE -i "$CLIENT_IF" -s "$SUBNET" -p tcp --dport 53 -j DNAT --to-destination "$HOTSPOT_ADDR:53"
 iptables -t nat -A TARASEC-HOTSPOT-PRE -j RETURN
+
+# Count authenticated clients before generic forwarding accepts them. The
+# count chain never authorizes traffic; every rule returns to this chain and
+# openNDS remains the actual per-client authorization layer.
+iptables -A TARASEC-HOTSPOT-FWD -j TARASEC-HOTSPOT-COUNT
+iptables -A TARASEC-HOTSPOT-COUNT -j RETURN
 
 # Generic client forwarding/NAT. openNDS remains the per-client authorization layer.
 for upstream in $UPSTREAMS; do
