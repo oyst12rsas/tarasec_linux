@@ -58,7 +58,8 @@ denied_page() {
     loginbase="$(hotspot_web_base)"
     echo "<div class=\"bad\">Internet access is not active</div><p>This device does not currently have access on this hotspot.</p>
 <div class=\"note\"><b>Already have a hotspot account?</b><br>Log in below. The existing hotspot subscription and quota rules decide whether Internet access is granted.</div>
-<form action=\"$loginbase/index.php?f=main_subLogin\" method=\"post\">
+<form action=\"$loginbase/portal_login.php\" method=\"post\">
+<input type=\"hidden\" name=\"client_ip\" value=\"$clientip\">
 <label for=\"tsuser\"><b>Username</b></label><input id=\"tsuser\" class=\"field\" name=\"name\" autocomplete=\"username\" required>
 <label for=\"tspass\"><b>Password</b></label><input id=\"tspass\" class=\"field\" name=\"pass\" type=\"password\" autocomplete=\"current-password\" required>
 <input class=\"btn\" type=\"submit\" value=\"Log in\"></form>
