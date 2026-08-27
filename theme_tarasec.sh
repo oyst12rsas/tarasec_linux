@@ -47,9 +47,10 @@ hotspot_web_base() {
 authenticated_status_page() {
     local loginbase
     loginbase="$(hotspot_web_base)"
+    if [ -z "${custom:-}" ]; then customhtml=""; else customhtml="<input type=\"hidden\" name=\"custom\" value=\"$custom\">"; fi
     echo "<div class=\"ok\">Welcome back</div>
 <p class=\"lead\">This device has active TaraSec hotspot access.</p>
-<a class=\"btn\" href=\"http://neverssl.com/\">Continue to Internet</a>
+<form action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\">$customhtml$custom_passthrough<input type=\"hidden\" name=\"landing\" value=\"yes\"><input class=\"btn\" type=\"submit\" value=\"Continue to Internet\"></form>
 <a class=\"btn btnlogout\" href=\"$loginbase/portal_status.php\">Log out</a>
 <a class=\"btn btn2\" href=\"$loginbase/portal_status.php\">My access / account information</a>
 <div class=\"note\"><b>About this hotspot</b><br>Learn about TaraSec and Taransvar, hotspot security, acceptable use and privacy from the information links below.</div>
@@ -76,17 +77,14 @@ $custom_inputs
 }
 
 thankyou_page() {
-    if [ -z "$custom" ]; then customhtml=""; else customhtml="<input type=\"hidden\" name=\"custom\" value=\"$custom\">"; fi
-    echo "<h2>Connecting&hellip;</h2><p>If this page remains visible, use the button below.</p>
-<form id=\"tsauth\" action=\"/opennds_preauth/\" method=\"get\"><input type=\"hidden\" name=\"fas\" value=\"$fas\">$customhtml$custom_passthrough<input type=\"hidden\" name=\"landing\" value=\"yes\"><input class=\"btn\" type=\"submit\" value=\"Continue\"></form>
-<script>document.getElementById('tsauth').submit();</script>"
-    footer
+    authenticated_status_page
 }
 
 landing_page() {
     configure_log_location; . "$mountpoint/ndscids/ndsinfo"; auth_log
     if [ "$ndsstatus" = "authenticated" ]; then
-        authenticated_status_page
+        echo "<div class=\"ok\">Internet access enabled</div><p>You can close this window and continue using the Internet.</p>"
+        footer
     else
         echo "<div class=\"bad\">Connection was not authorized</div><p>The request may have timed out. Please try again.</p><form><input class=\"btn\" type=\"button\" value=\"Try again\" onClick=\"location.href='http://$gatewayfqdn'\"></form>"
         footer
