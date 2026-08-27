@@ -1,9 +1,10 @@
 #!/bin/bash
 # Keep openNDS clients synchronized with TaraSec's existing access table.
-# First account usage, then refresh access from active sessions/subscriptions,
-# then enforce both directions in openNDS:
-#   - authenticated + no TaraSec access => deauthenticate
-#   - preauthenticated + TaraSec access => authenticate
+# First account usage, then refresh access from active sessions/subscriptions.
+# Enforcement deliberately does NOT auto-authenticate Preauthenticated clients:
+# a reconnecting subscriber with valid TaraSec access must see the captive
+# welcome page and press Continue to Internet. This preserves the active TaraSec
+# subscriber session without silently bypassing the portal.
 set -u
 
 CHECKER="${TARASEC_ACCESS_CHECKER:-/usr/local/sbin/tarasec-access-check}"
@@ -20,8 +21,6 @@ errors=0
 usage_ok=true
 refresh_ok=true
 
-# Usage must be synchronized before refreshing access so quota exhaustion in
-# this poll can remove access immediately.
 if [ -x "$USAGE" ]; then
   if ! "$USAGE"; then
     usage_ok=false
@@ -52,18 +51,9 @@ while IFS=$'\t' read -r mac ip state; do
   checked=$((checked+1))
 
   if "$CHECKER" "$ip"; then
-    # A client that was revoked because quota/subscription expired remains in
-    # openNDS as Preauthenticated after TaraSec access is restored. Promote it
-    # automatically instead of forcing another captive-portal login.
-    if [ "$state" = "Preauthenticated" ]; then
-      if ndsctl auth "$mac" 0 0 0 0 0 "TaraSec access restored" >/dev/null 2>&1; then
-        granted=$((granted+1))
-        logger -t tarasec-access "granted $mac/$ip: access table allows preauthenticated client"
-      else
-        errors=$((errors+1))
-        logger -t tarasec-access "FAILED to grant $mac/$ip"
-      fi
-    fi
+    # Valid access + Preauthenticated is intentional. Leave it that way so the
+    # OS captive-portal detector opens TaraSec's welcome page. The user's
+    # Continue button performs the openNDS authorization.
     continue
   fi
 
