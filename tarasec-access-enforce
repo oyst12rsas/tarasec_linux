@@ -1,43 +1,70 @@
 #!/bin/bash
-# Keep openNDS authenticated clients synchronized with TaraSec's existing access table.
-# Missing row, hasaccess != 1, or DB/checker failure => fail closed and deauthenticate.
+# Keep openNDS clients synchronized with TaraSec's existing access table.
+# First account usage, then refresh access from active sessions/subscriptions.
+# Enforcement deliberately does NOT auto-authenticate Preauthenticated clients:
+# a reconnecting subscriber with valid TaraSec access must see the captive
+# welcome page and press Continue to Internet. This preserves the active TaraSec
+# subscriber session without silently bypassing the portal.
 set -u
 
 CHECKER="${TARASEC_ACCESS_CHECKER:-/usr/local/sbin/tarasec-access-check}"
+USAGE="${TARASEC_USAGE_SYNC:-/usr/local/sbin/tarasec-usage-sync}"
+REFRESHER="${TARASEC_ACCESS_REFRESHER:-/usr/local/sbin/tarasec-access-refresh}"
 OUT="${TARASEC_ACCESS_STATE:-/run/tarasec-access-enforcement.json}"
 TMP=$(mktemp)
 trap 'rm -f "$TMP"' EXIT
 
 checked=0
 revoked=0
+granted=0
 errors=0
+usage_ok=true
+refresh_ok=true
+
+if [ -x "$USAGE" ]; then
+  if ! "$USAGE"; then
+    usage_ok=false
+    errors=$((errors+1))
+  fi
+fi
+
+if [ -x "$REFRESHER" ]; then
+  if ! "$REFRESHER"; then
+    refresh_ok=false
+    errors=$((errors+1))
+  fi
+fi
 
 if ! command -v ndsctl >/dev/null 2>&1 || [ ! -x "$CHECKER" ]; then
-  printf '{"ok":false,"checked":0,"revoked":0,"errors":1,"reason":"missing_ndsctl_or_checker"}\n' >"$OUT"
+  printf '{"ok":false,"usage_ok":%s,"refresh_ok":%s,"checked":0,"granted":0,"revoked":0,"errors":%d,"reason":"missing_ndsctl_or_checker"}\n' "$usage_ok" "$refresh_ok" "$((errors+1))" >"$OUT"
   exit 1
 fi
 
 if ! ndsctl json >"$TMP" 2>/dev/null; then
-  printf '{"ok":false,"checked":0,"revoked":0,"errors":1,"reason":"ndsctl_failed"}\n' >"$OUT"
+  printf '{"ok":false,"usage_ok":%s,"refresh_ok":%s,"checked":0,"granted":0,"revoked":0,"errors":%d,"reason":"ndsctl_failed"}\n' "$usage_ok" "$refresh_ok" "$((errors+1))" >"$OUT"
   exit 1
 fi
 
-# Python is used only to safely parse ndsctl JSON. Output: MAC<TAB>IP<TAB>STATE
 while IFS=$'\t' read -r mac ip state; do
   [ -n "$mac" ] || continue
-  [ "$state" = "Authenticated" ] || continue
+  [ -n "$ip" ] || continue
   checked=$((checked+1))
 
   if "$CHECKER" "$ip"; then
+    # Valid access + Preauthenticated is intentional. Leave it that way so the
+    # OS captive-portal detector opens TaraSec's welcome page. The user's
+    # Continue button performs the openNDS authorization.
     continue
   fi
 
-  if ndsctl deauth "$mac" >/dev/null 2>&1; then
-    revoked=$((revoked+1))
-    logger -t tarasec-access "revoked $mac/$ip: access table no longer allows client"
-  else
-    errors=$((errors+1))
-    logger -t tarasec-access "FAILED to revoke $mac/$ip"
+  if [ "$state" = "Authenticated" ]; then
+    if ndsctl deauth "$mac" >/dev/null 2>&1; then
+      revoked=$((revoked+1))
+      logger -t tarasec-access "revoked $mac/$ip: access table no longer allows client"
+    else
+      errors=$((errors+1))
+      logger -t tarasec-access "FAILED to revoke $mac/$ip"
+    fi
   fi
 done < <(python3 - "$TMP" <<'PY'
 import json, sys
@@ -50,5 +77,5 @@ PY
 
 ok=true
 [ "$errors" -eq 0 ] || ok=false
-printf '{"ok":%s,"checked":%d,"revoked":%d,"errors":%d}\n' "$ok" "$checked" "$revoked" "$errors" >"$OUT"
+printf '{"ok":%s,"usage_ok":%s,"refresh_ok":%s,"checked":%d,"granted":%d,"revoked":%d,"errors":%d}\n' "$ok" "$usage_ok" "$refresh_ok" "$checked" "$granted" "$revoked" "$errors" >"$OUT"
 [ "$errors" -eq 0 ]

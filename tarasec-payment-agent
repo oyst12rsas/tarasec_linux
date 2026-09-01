@@ -1,0 +1,160 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+$configPath = getenv('TARASEC_PAYMENT_CLIENT_CONFIG') ?: '/etc/tarasec/payment-client.php';
+if (!is_readable($configPath)) {
+    fwrite(STDERR, "Missing payment client config: $configPath\n");
+    exit(1);
+}
+$config = require $configPath;
+if (!is_array($config)) {
+    fwrite(STDERR, "Invalid payment client config\n");
+    exit(1);
+}
+foreach (['base_url','hotspot_id','api_token'] as $k) {
+    if (empty($config[$k])) {
+        fwrite(STDERR, "Missing config key: $k\n");
+        exit(1);
+    }
+}
+$dbConfigPath = '/etc/tarasec/hotspot-db.php';
+if (!is_readable($dbConfigPath)) {
+    fwrite(STDERR, "Missing hotspot DB config\n");
+    exit(1);
+}
+$dbCfg = require $dbConfigPath;
+$pdo = new PDO(
+    'mysql:host=' . $dbCfg['host'] . ';dbname=' . $dbCfg['database'] . ';charset=utf8mb4',
+    $dbCfg['username'],
+    $dbCfg['password'],
+    [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]
+);
+
+function apiRequest(array $config, string $method, string $path, ?array $body = null): array
+{
+    $ch = curl_init(rtrim($config['base_url'], '/') . $path);
+    $headers = [
+        'Authorization: Bearer ' . $config['api_token'],
+        'Accept: application/json',
+    ];
+    if ($body !== null) {
+        $headers[] = 'Content-Type: application/json';
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_UNESCAPED_SLASHES));
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 20,
+        CURLOPT_HTTPHEADER => $headers,
+    ]);
+    $raw = curl_exec($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if ($raw === false || $status < 200 || $status >= 300) {
+        throw new RuntimeException("Payment API failed HTTP $status" . ($err ? ": $err" : ''));
+    }
+    $json = json_decode($raw, true);
+    if (!is_array($json) || empty($json['ok'])) {
+        throw new RuntimeException('Invalid payment API response');
+    }
+    return $json;
+}
+
+function ensureExistingUser(PDO $pdo, string $username): array
+{
+    $st = $pdo->prepare('SELECT username,subscriptionType,mbquota,COALESCE(mbusage,0) AS mbusage,expirytime FROM radcheck WHERE username=? LIMIT 1');
+    $st->execute([$username]);
+    $row = $st->fetch();
+    if (!$row) {
+        throw new RuntimeException("Unknown hotspot user: $username");
+    }
+    return $row;
+}
+
+function applyEntitlement(PDO $pdo, array $e): string
+{
+    $username = trim((string)($e['username'] ?? ''));
+    if ($username === '') {
+        throw new RuntimeException('Entitlement has no username');
+    }
+    ensureExistingUser($pdo, $username);
+
+    $type = (string)$e['subscription_type'];
+    $quota = isset($e['quota_mb']) ? (float)$e['quota_mb'] : 0.0;
+    $hours = isset($e['validity_hours']) ? (int)$e['validity_hours'] : 0;
+
+    $pdo->beginTransaction();
+    try {
+        if ($type === 'quota' || $type === 'limited') {
+            if ($quota <= 0) {
+                throw new RuntimeException('Invalid quota entitlement');
+            }
+            // Purchased quota is added on top of current usage so the customer
+            // receives the full purchased amount even if an old quota was exhausted.
+            $st = $pdo->prepare('UPDATE radcheck SET mbquota=COALESCE(mbusage,0)+? WHERE username=?');
+            $st->execute([$quota, $username]);
+        }
+
+        if ($type === 'expiry' || $type === 'limited') {
+            if ($hours <= 0) {
+                throw new RuntimeException('Invalid validity entitlement');
+            }
+            // Extend from the later of NOW() and any existing future expiry.
+            $sql = 'UPDATE radcheck SET expirytime=DATE_ADD(CASE WHEN expirytime IS NOT NULL AND expirytime>NOW() THEN expirytime ELSE NOW() END, INTERVAL ' . $hours . ' HOUR) WHERE username=?';
+            $pdo->prepare($sql)->execute([$username]);
+        }
+
+        $pdo->prepare('UPDATE radcheck SET subscriptionType=? WHERE username=?')->execute([$type, $username]);
+        $pdo->commit();
+    } catch (Throwable $x) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $x;
+    }
+
+    return sprintf('applied %s plan to %s', $type, $username);
+}
+
+try {
+    $hotspotId = rawurlencode((string)$config['hotspot_id']);
+    $data = apiRequest($config, 'GET', '/v1/entitlements?hotspot_id=' . $hotspotId);
+    $applied = 0;
+    $errors = 0;
+
+    foreach (($data['entitlements'] ?? []) as $e) {
+        $id = (int)($e['entitlement_id'] ?? 0);
+        if ($id <= 0) {
+            continue;
+        }
+        try {
+            $result = applyEntitlement($pdo, $e);
+            apiRequest($config, 'POST', '/v1/entitlements/claim', [
+                'hotspot_id' => $config['hotspot_id'],
+                'entitlement_id' => $id,
+                'result' => $result,
+            ]);
+            $applied++;
+            error_log('TaraSec payment entitlement ' . $id . ': ' . $result);
+        } catch (Throwable $x) {
+            $errors++;
+            error_log('TaraSec payment entitlement ' . $id . ' failed: ' . $x->getMessage());
+        }
+    }
+
+    if (is_executable('/usr/local/sbin/tarasec-access-refresh')) {
+        exec('/usr/local/sbin/tarasec-access-refresh >/dev/null 2>&1');
+    }
+    if (is_executable('/usr/local/sbin/tarasec-access-enforce')) {
+        exec('/usr/local/sbin/tarasec-access-enforce >/dev/null 2>&1');
+    }
+
+    echo json_encode(['ok' => $errors === 0, 'received' => count($data['entitlements'] ?? []), 'applied' => $applied, 'errors' => $errors], JSON_UNESCAPED_SLASHES) . "\n";
+    exit($errors === 0 ? 0 : 2);
+} catch (Throwable $e) {
+    fwrite(STDERR, json_encode(['ok' => false, 'error' => $e->getMessage()], JSON_UNESCAPED_SLASHES) . "\n");
+    exit(1);
+}
