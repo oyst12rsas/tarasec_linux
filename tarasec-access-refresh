@@ -1,0 +1,61 @@
+#!/bin/bash
+# Refresh TaraSec's existing access table from active hotspot sessions.
+# This is the access-producing part extracted from the legacy db.pl logic.
+# It deliberately does NOT modify firewall rules; openNDS enforces per-client access.
+set -u
+
+DB_NAME="${TARASEC_ACCESS_DB:-taransvar}"
+MYSQL_CNF="${TARASEC_ACCESS_MYSQL_CNF:-/etc/tarasec/access-mysql.cnf}"
+OUT="${TARASEC_ACCESS_REFRESH_STATE:-/run/tarasec-access-refresh.json}"
+
+MYSQL=(mysql)
+if [ -r "$MYSQL_CNF" ]; then MYSQL+=(--defaults-extra-file="$MYSQL_CNF"); fi
+MYSQL+=(--batch --skip-column-names --raw "$DB_NAME")
+
+# Preserve the legacy eligibility rules:
+# quota   -> usage below quota
+# expiry  -> expirytime in future
+# other   -> both quota and expiry valid
+# Session must be active, not logged out and active within the last hour.
+result=$("${MYSQL[@]}" 2>/dev/null <<'SQL'
+START TRANSACTION;
+CREATE TEMPORARY TABLE tarasec_valid_access (
+  ip varchar(20) NOT NULL PRIMARY KEY
+) ENGINE=MEMORY;
+
+INSERT IGNORE INTO tarasec_valid_access(ip)
+SELECT DISTINCT s.ip
+FROM session s
+JOIN radcheck r ON r.username=s.username
+WHERE s.active=1
+  AND s.logouttime IS NULL
+  AND s.lastrequest > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+  AND s.ip REGEXP '^[0-9]{1,3}(\\.[0-9]{1,3}){3}$'
+  AND IF(r.subscriptionType='quota',
+         COALESCE(r.mbusage,0) < r.mbquota,
+         IF(r.subscriptionType='expiry',
+            r.expirytime > NOW(),
+            COALESCE(r.mbusage,0) < r.mbquota AND r.expirytime > NOW()));
+
+SELECT COUNT(*) FROM tarasec_valid_access;
+
+INSERT INTO access(ip,hasaccess,updated)
+SELECT ip,1,NOW() FROM tarasec_valid_access
+ON DUPLICATE KEY UPDATE hasaccess=1, updated=NOW();
+
+DELETE a FROM access a
+LEFT JOIN tarasec_valid_access v ON v.ip=a.ip
+WHERE v.ip IS NULL;
+
+COMMIT;
+SQL
+) || {
+  printf '{"ok":false,"valid":0,"errors":1,"reason":"mysql_refresh_failed"}\n' >"$OUT"
+  logger -t tarasec-access "access refresh failed"
+  exit 1
+}
+
+valid=$(printf '%s\n' "$result" | tail -1 | tr -cd '0-9')
+valid=${valid:-0}
+printf '{"ok":true,"valid":%d,"errors":0}\n' "$valid" >"$OUT"
+exit 0

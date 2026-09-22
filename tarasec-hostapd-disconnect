@@ -1,0 +1,26 @@
+#!/bin/bash
+# hostapd_cli action script for TaraSec captive reconnect handling.
+# On a real Wi-Fi station disconnect, deauthenticate only the openNDS client.
+# Do NOT close the TaraSec subscriber DB session here; that is reserved for
+# deliberate subscriber logout handled through client_deauth/custombinauth.
+set -u
+
+IFACE="${1:-}"
+EVENT="${2:-}"
+MAC="${3:-}"
+
+case "$EVENT" in
+  AP-STA-DISCONNECTED)
+    if [[ "$MAC" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+      if command -v ndsctl >/dev/null 2>&1; then
+        if ndsctl deauth "$MAC" >/dev/null 2>&1; then
+          logger -t tarasec-wifi "openNDS deauthenticated $MAC after Wi-Fi disconnect on $IFACE"
+        else
+          logger -t tarasec-wifi "openNDS deauth skipped/failed for $MAC after Wi-Fi disconnect on $IFACE"
+        fi
+      fi
+    fi
+    ;;
+esac
+
+exit 0
